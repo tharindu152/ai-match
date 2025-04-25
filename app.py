@@ -21,6 +21,8 @@ label_encoders = {}
 for column in categorical_columns:
     label_encoders[column] = joblib.load(f'encoders/{column}_encoder.joblib')
 
+lecturer_id_encoder = joblib.load(f'encoders/lecturer_id_encoder.joblib')
+
 # Load the scaler
 scaler = joblib.load('encoders/numerical_scaler.joblib')
 
@@ -58,16 +60,21 @@ def predict():
 
         # Get top 3 recommendations with probabilities
         top_3_indices = np.argsort(probabilities)[-3:][::-1]
+        # Decode the predicted lecturer id
+        predicted_lecturer_id = lecturer_id_encoder.inverse_transform([prediction])[0]
+
+        # Decode the top 3 recommendations
         recommendations = [
             {
-                'lecturer_id': int(idx),
+                'lecturer_id': int(lecturer_id_encoder.inverse_transform([idx])[0]),
                 'probability': float(probabilities[idx])
             }
             for idx in top_3_indices
         ]
 
+
         return jsonify({
-            'predicted_lecturer_id': int(prediction),
+            'predicted_lecturer_id': predicted_lecturer_id,
             'top_3_recommendations': recommendations
         })
 

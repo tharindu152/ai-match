@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 import pandas as pd
 import joblib
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 import numpy as np
 
 app = Flask(__name__)
@@ -11,8 +13,8 @@ model = joblib.load('lecturer_matcher_rf.joblib')
 
 # Load the label encoders and scaler from data cleaning
 # Note: You'll need to save these during training
-categorical_columns = ['program', 'level', 'time_pref', 'subject']
-numerical_columns = ['hourly_pay', 'student_count', 'credits', 'institute_rating']
+categorical_columns = ['program', 'level', 'time_pref', 'subject', 'division', 'status', 'language']
+numerical_columns = ['hourly_pay', 'student_count', 'credits', 'institute_rating', 'duration']
 
 # Initialize dictionaries to store encoders
 label_encoders = {}
@@ -75,6 +77,79 @@ def predict():
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'healthy'})
+
+@app.route('/retrain', methods=['POST'])
+def retrain():
+    try:
+        # Check if JSON data is provided
+        if not request.is_json:
+            return jsonify({'error': 'Request must be JSON'}), 400
+
+        # Parse JSON data directly
+        data = request.get_json()
+        new_data = pd.DataFrame(data)
+
+        # Validate required columns
+        required_columns = categorical_columns + numerical_columns + ['lecturer_id']
+        missing_columns = [col for col in required_columns if col not in new_data.columns]
+        if missing_columns:
+            return jsonify({'error': f'Missing required columns: {missing_columns}'}), 400
+
+        # Train model from scratch with new data
+        new_model, X, y = train_model(new_data)
+
+        # Calculate training metrics
+        train_score = new_model.score(X, y)
+
+        # Update global model
+        global model
+        model = new_model
+
+        return jsonify({
+            'message': 'Model trained from scratch successfully',
+            'training_accuracy': float(train_score),
+            'n_samples': len(new_data),
+            'n_features': X.shape[1]
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def train_model(df):
+    """
+    Train the model with new data
+    """
+    # Prepare features and target
+    X = df.drop('lecturer_id', axis=1)
+    y = df['lecturer_id']
+
+    # Encode categorical variables
+    for column in categorical_columns:
+        if column in X.columns:
+            label_encoders[column] = LabelEncoder()
+            X[column] = label_encoders[column].fit_transform(X[column])
+            joblib.dump(label_encoders[column], f'encoders/{column}_encoder.joblib')
+
+    # Scale numerical variables
+    scaler_new = StandardScaler()
+    X[numerical_columns] = scaler_new.fit_transform(X[numerical_columns])
+    joblib.dump(scaler_new, 'encoders/numerical_scaler.joblib')
+
+    # Train model
+    rf_model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        random_state=42
+    )
+    rf_model.fit(X, y)
+
+    # Save model
+    joblib.dump(rf_model, 'lecturer_matcher_rf.joblib')
+
+    return rf_model, X, y
 
 if __name__ == '__main__':
     app.run(debug=True) 

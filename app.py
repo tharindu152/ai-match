@@ -1,9 +1,15 @@
 """HTTP API for lecturer matching."""
 
+import atexit
+import json
 import logging
 import math
 import os
+import re
 import threading
+import urllib.request
+import urllib.error
+import urllib.parse
 from functools import wraps
 from pathlib import Path
 
@@ -18,7 +24,65 @@ from werkzeug.exceptions import HTTPException
 
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = Path(os.environ.get("MODEL_DIR", BASE_DIR)).expanduser()
+logger = logging.getLogger(__name__)
+
+
+def _resolve_config_value(value):
+    if not isinstance(value, str):
+        return value
+
+    def replace(match):
+        name, default = match.groups()
+        return os.environ.get(name, default if default is not None else match.group(0))
+
+    return re.sub(r"\$\{([^}:]+)(?::([^}]*))?\}", replace, value)
+
+
+def _load_remote_config():
+    config_server_url = os.environ.get("CONFIG_SERVER_URL")
+    if not config_server_url:
+        return {}
+
+    application_name = os.environ.get("SERVICE_NAME", "ai-match-service")
+    profile = os.environ.get("CONFIG_PROFILE", "default")
+    config_url = (
+        f"{config_server_url.rstrip('/')}/"
+        f"{urllib.parse.quote(application_name, safe='')}/"
+        f"{urllib.parse.quote(profile, safe='')}"
+    )
+    try:
+        with urllib.request.urlopen(config_url, timeout=5) as response:
+            config = json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        logger.exception("Unable to load configuration from %s", config_url)
+        return {}
+
+    property_sources = config.get("propertySources")
+    if not isinstance(property_sources, list):
+        logger.error("Config Server returned no propertySources for %s", config_url)
+        return {}
+
+    properties = {}
+    for property_source in reversed(property_sources):
+        source = property_source.get("source")
+        if isinstance(source, dict):
+            properties.update(source)
+    return {
+        key: _resolve_config_value(value)
+        for key, value in properties.items()
+    }
+
+
+REMOTE_CONFIG = _load_remote_config()
+
+
+def _setting(environment_name, config_name, default):
+    if environment_name in os.environ:
+        return os.environ[environment_name]
+    return REMOTE_CONFIG.get(config_name, default)
+
+
+MODEL_DIR = Path(_setting("MODEL_DIR", "application.ai-match.model-dir", str(BASE_DIR))).expanduser()
 if not MODEL_DIR.is_absolute():
     MODEL_DIR = BASE_DIR / MODEL_DIR
 MODEL_DIR = MODEL_DIR.resolve()
@@ -63,9 +127,19 @@ KEYCLOAK_JWK_SET_URI = os.environ.get(
     "KEYCLOAK_JWK_SET_URI",
     "http://localhost:7080/realms/lecturelink/protocol/openid-connect/certs",
 )
+SERVICE_NAME = str(
+    _setting("SERVICE_NAME", "spring.application.name", "ai-match-service")
+)
+SERVICE_PORT = int(_setting("SERVER_PORT", "server.port", "5000"))
+EUREKA_URL = str(
+    _setting(
+        "EUREKA_URL",
+        "eureka.client.service-url.defaultZone",
+        "http://localhost:8070/eureka/",
+    )
+)
 
 app = Flask(__name__)
-logger = logging.getLogger(__name__)
 state_lock = threading.RLock()
 jwks_client = jwt.PyJWKClient(KEYCLOAK_JWK_SET_URI, cache_keys=True)
 
@@ -426,7 +500,30 @@ def handle_unexpected_error(error):
     return _error("An internal server error occurred", 500)
 
 
+def _log_eureka_error(error_type, error):
+    logger.error("Eureka client reported %s: %s", error_type, error)
+
+
+def _register_with_eureka():
+    from py_eureka_client import eureka_client
+
+    options = {
+        "eureka_server": EUREKA_URL,
+        "app_name": SERVICE_NAME,
+        "instance_port": SERVICE_PORT,
+        "on_error": _log_eureka_error,
+    }
+    instance_host = os.environ.get("EUREKA_INSTANCE_HOST")
+    if instance_host:
+        options["instance_host"] = instance_host
+
+    eureka_client.init(**options)
+    atexit.register(eureka_client.stop)
+    logger.info("Registered %s with Eureka at %s", SERVICE_NAME, EUREKA_URL)
+
+
 if __name__ == "__main__":
     from waitress import serve
 
-    serve(app, host="0.0.0.0", port=5000)
+    _register_with_eureka()
+    serve(app, host="0.0.0.0", port=SERVICE_PORT)

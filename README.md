@@ -1,127 +1,136 @@
-# Lecturer Matcher API
+# AI Match Service
 
-This API provides lecturer recommendations for courses based on a trained Random Forest model.
+This Python service recommends lecturers for a course using the supplied
+Random Forest model. Artifacts are loaded from `MODEL_DIR`, which defaults to
+the directory containing `app.py`; startup does not depend on the current
+working directory. Keep `lecturer_matcher_rf.joblib` and the `encoders/`
+directory together under the configured model directory.
 
-## Setup
+## Run locally
 
-1. Install required packages:
-```bash
-pip install flask pandas numpy scikit-learn joblib
-```
+From this directory, install the pinned model/runtime dependencies and start
+the production WSGI server:
 
-2. Run the Flask application:
-```bash
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 python app.py
 ```
 
-The server will start on `http://localhost:5000`
+The service listens on `http://localhost:5000`; it does not use Flask's debug
+server. Use `python3 -m venv .venv`, `source .venv/bin/activate` on Linux/macOS.
+Scikit-learn is pinned to the version used to serialize the supplied model.
+To store artifacts elsewhere, set `MODEL_DIR` before starting the service. For
+example, on Linux/macOS use `MODEL_DIR=/path/to/model python app.py`; in
+PowerShell use `$env:MODEL_DIR = 'C:\path\to\model'` before `python app.py`.
+Retraining writes the replacement model and all encoders to that directory.
 
-## API Endpoints
+## Run with Docker
 
-### Health Check
+Build and start the service from this directory:
 
-Check if the API is running.
-
-```bash
-GET /health
+```sh
+docker build -t ai-match-service .
+docker run --rm -p 5000:5000 ai-match-service
 ```
 
-Sample request:
-```bash
-curl http://localhost:5000/health
+The image contains only the API, dependencies, trained model, and encoders;
+training notebooks and source data are not included. It sets `MODEL_DIR=/model`
+and stores the supplied artifacts at `/model`, separate from the application
+code in `/app`. Mount a volume there to retain trained artifacts without
+hiding application files:
+
+```sh
+docker run --rm -p 5000:5000 -v ai-match-model:/model ai-match-service
 ```
 
-Sample response:
-```json
-{
-    "status": "healthy"
-}
-```
+## API
 
-### Predict Lecturer
+All error responses use `{"error": "..."}`. Invalid or incomplete input returns
+HTTP 400; unexpected server errors return HTTP 500. Categorical values are
+case-insensitive and surrounding whitespace is ignored. They must otherwise
+match the fitted encoders' known values. Every feature below is required.
+Except for `GET /health`, requests require a Keycloak bearer token. Set
+`KEYCLOAK_ISSUER_URI` to the exact issuer in the token and
+`KEYCLOAK_JWK_SET_URI` to the Keycloak realm's signing-key endpoint. Prediction
+requires the `LECTURER` realm role; retraining requires `INSTITUTE`.
 
-Get lecturer recommendations for a course.
+### `GET /health`
 
-```bash
-POST /predict
-```
+Returns `{"status": "healthy"}` when the model artifacts have loaded and the
+service is ready.
 
-#### Request Format
+### `POST /predict`
 
-Content-Type: `application/json`
+Requires `Authorization: Bearer <LECTURER access token>`.
 
-| Field | Type | Description | Example |
-|-------|------|-------------|---------|
-| program | string | Name of the program | "Bachelor of Commerce" |
-| hourly_pay | number | Hourly payment for lecturer | 3000 |
-| level | string | Academic level | "Bachelors" |
-| time_pref | string | Time preference | "Weekend" |
-| student_count | number | Number of students | 50 |
-| subject | string | Subject name | "Business Analytics" |
-| credits | number | Number of credits | 3 |
-| institute_rating | number | Institute rating | 4.8 |
+Send a JSON object with these fields:
 
-#### Sample Request
+| Field | Type | Example |
+| --- | --- | --- |
+| `program` | string | `"Bachelor of Commerce"` |
+| `level` | string | `"Bachelors"` |
+| `time_pref` | string | `"Weekend"` |
+| `subject` | string | `"Strategic Management"` |
+| `division` | string | `"Kotte"` |
+| `status` | string | `"ACTIVE"` |
+| `language` | string | `"English"` |
+| `hourly_pay` | number | `3300` |
+| `student_count` | number | `50` |
+| `credits` | number | `3` |
+| `institute_rating` | number | `4.8` |
+| `duration` | number | `1095` |
 
-```bash
+Example:
+
+```sh
 curl -X POST http://localhost:5000/predict \
--H "Content-Type: application/json" \
--d '{
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
     "program": "Bachelor of Commerce",
-    "hourly_pay": 3000,
     "level": "Bachelors",
     "time_pref": "Weekend",
+    "subject": "Strategic Management",
+    "division": "Kotte",
+    "status": "ACTIVE",
+    "language": "English",
+    "hourly_pay": 3300,
     "student_count": 50,
-    "subject": "Business Analytics",
     "credits": 3,
-    "institute_rating": 4.8
-}'
+    "institute_rating": 4.8,
+    "duration": 1095
+  }'
 ```
 
-#### Sample Response
+Successful predictions return the predicted ID and up to three recommendations:
 
 ```json
 {
-    "predicted_lecturer_id": 5,
-    "top_3_recommendations": [
-        {
-            "lecturer_id": 5,
-            "probability": 0.85
-        },
-        {
-            "lecturer_id": 2,
-            "probability": 0.10
-        },
-        {
-            "lecturer_id": 7,
-            "probability": 0.05
-        }
-    ]
+  "predicted_lecturer_id": 5,
+  "top_3_recommendations": [
+    {"lecturer_id": 5, "probability": 0.85},
+    {"lecturer_id": 2, "probability": 0.1},
+    {"lecturer_id": 7, "probability": 0.05}
+  ]
 }
 ```
 
-#### Error Response
+### `POST /retrain`
 
-If there's an error, the API will return a 400 or 500 status code with an error message:
+Requires `Authorization: Bearer <INSTITUTE access token>`.
 
-```json
-{
-    "error": "Invalid value for level. Valid values are: ['Bachelors', 'Masters', 'Doctorate', 'PostGraduate', 'HND', 'HNC']"
-}
+Accepts a non-empty JSON array of training records. Each record must contain
+all prediction fields plus a `lecturer_id`. Categorical values may include new
+categories; retraining fits fresh encoders and scaler. At least two records and
+two distinct lecturer IDs are required. A successful request replaces the
+in-memory model and writes the updated model and encoders under `MODEL_DIR`.
+Do not send untrusted datasets to this endpoint.
+
+```sh
+curl -X POST http://localhost:5000/retrain \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '[{"program":"Bachelor of Commerce","level":"Bachelors","time_pref":"Weekend","subject":"Strategic Management","division":"Kotte","status":"ACTIVE","language":"English","hourly_pay":3300,"student_count":50,"credits":3,"institute_rating":4.8,"duration":1095,"lecturer_id":5},{"program":"Bachelor of Commerce","level":"Bachelors","time_pref":"Weekday","subject":"Business Statistics","division":"Kotte","status":"ACTIVE","language":"English","hourly_pay":3300,"student_count":35,"credits":3,"institute_rating":4.8,"duration":1095,"lecturer_id":2}]'
 ```
-
-## Notes
-
-1. All fields in the request are required
-2. Values for categorical fields (program, level, time_pref, subject) must match the trained model's categories
-3. Numerical values should be within reasonable ranges
-4. The API returns the top 3 recommended lecturers with their probability scores
-
-## Error Handling
-
-The API handles several types of errors:
-- Missing required fields
-- Invalid values for categorical fields
-- Server-side processing errors
-
-Each error response includes a descriptive message to help identify the issue.
